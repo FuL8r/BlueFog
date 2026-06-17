@@ -1,1 +1,30 @@
+<<<<<<< HEAD
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+venv/
+.venv/
+
+# Local data / storage (не версионируем)
+qdrant_storage/
+pdf_storage/
+pages/
+data/
+sync_state.json
+
+# Секреты / окружение
 .env
+*.key
+
+# Claude / инструменты и planning-артефакты (не версионируем)
+.claude/
+docs/
+
+# OS
+.DS_Store
+=======
+.env
+>>>>>>> c197ffefcec9f9ac1b91600d7af84164d850ce99

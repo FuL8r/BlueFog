@@ -1,0 +1,95 @@
+from __future__ import annotations
+import uuid
+from qdrant_client import QdrantClient, models as qm
+from vulnrag.models import Vulnerability
+
+
+def _point_id(cve_id: str) -> str:
+    # Deterministic UUID so re-upserting the same CVE overwrites (idempotent).
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, cve_id))
+
+
+class Hit:
+    def __init__(self, cve_id: str, score: float, payload: dict):
+        self.cve_id = cve_id
+        self.score = score
+        self.payload = payload
+
+
+class VulnStore:
+    def __init__(self, client: QdrantClient, collection: str, dim: int):
+        self.client = client
+        self.collection = collection
+        self.dim = dim
+        self._products_cache: set[str] | None = None
+
+    def ensure_collection(self):
+        if not self.client.collection_exists(self.collection):
+            self.client.create_collection(
+                self.collection,
+                vectors_config=qm.VectorParams(size=self.dim, distance=qm.Distance.COSINE),
+            )
+        # Payload indexes for fast filtered search (idempotent — safe to re-run).
+        self.client.create_payload_index(
+            self.collection, field_name="products",
+            field_schema=qm.PayloadSchemaType.KEYWORD)
+        self.client.create_payload_index(
+            self.collection, field_name="is_kev",
+            field_schema=qm.PayloadSchemaType.BOOL)
+
+    def _payload(self, v: Vulnerability) -> dict:
+        products = sorted({a.product for a in v.affected})
+        return {
+            "cve_id": v.cve_id,
+            "description": v.description,
+            "severity": v.severity,
+            "cvss_score": v.cvss_score,
+            "is_kev": v.is_kev,
+            "year": v.published.year,
+            "products": products,
+            "fixed_versions": v.fixed_versions,
+            "references": v.references,
+            "affected": [a.model_dump() for a in v.affected],
+            "sources": v.sources,
+        }
+
+    def upsert(self, vulns: list[Vulnerability], vectors: list[list[float]]):
+        points = [
+            qm.PointStruct(id=_point_id(v.cve_id), vector=vec, payload=self._payload(v))
+            for v, vec in zip(vulns, vectors)
+        ]
+        self.client.upsert(self.collection, points=points)
+
+    def distinct_products(self, refresh: bool = False) -> set[str]:
+        """All distinct product names in the collection (cached after first call)."""
+        if self._products_cache is not None and not refresh:
+            return self._products_cache
+        products: set[str] = set()
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                self.collection, limit=1000, with_payload=["products"],
+                with_vectors=False, offset=offset)
+            for p in points:
+                for prod in (p.payload or {}).get("products", []):
+                    products.add(prod)
+            if offset is None:
+                break
+        self._products_cache = products
+        return products
+
+    def count(self) -> int:
+        return self.client.count(self.collection).count
+
+    def search(self, vector: list[float], *, product: str | None = None,
+               is_kev: bool | None = None, top_k: int = 8) -> list[Hit]:
+        must = []
+        if product:
+            must.append(qm.FieldCondition(key="products", match=qm.MatchValue(value=product)))
+        if is_kev is not None:
+            must.append(qm.FieldCondition(key="is_kev", match=qm.MatchValue(value=is_kev)))
+        flt = qm.Filter(must=must) if must else None
+        res = self.client.query_points(
+            self.collection, query=vector, query_filter=flt, limit=top_k,
+            with_payload=True).points
+        return [Hit(p.payload["cve_id"], p.score, p.payload) for p in res]

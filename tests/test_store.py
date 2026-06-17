@@ -1,0 +1,78 @@
+from datetime import date
+from qdrant_client import QdrantClient
+from vulnrag.models import AffectedProduct, Vulnerability
+from vulnrag.clients import StubEmbedder
+from vulnrag.store import VulnStore
+
+
+def _vuln(cve_id, product):
+    return Vulnerability(cve_id=cve_id, description=f"{product} bug",
+                         severity="HIGH", affected=[AffectedProduct(product=product)],
+                         published=date(2021, 1, 1), last_modified=date(2021, 1, 1))
+
+
+def _store():
+    client = QdrantClient(":memory:")
+    store = VulnStore(client, collection="test", dim=1024)
+    store.ensure_collection()
+    return store
+
+
+def test_upsert_then_count_and_filter_search():
+    store = _store()
+    emb = StubEmbedder(dim=1024)
+    vulns = [_vuln("CVE-1", "log4j"), _vuln("CVE-2", "python")]
+    vectors = emb.embed([v.description for v in vulns])
+    store.upsert(vulns, vectors)
+    assert store.count() == 2
+
+    qvec = emb.embed(["log4j problem"])[0]
+    hits = store.search(qvec, product="log4j", top_k=5)
+    assert [h.cve_id for h in hits] == ["CVE-1"]
+
+
+def test_ensure_collection_creates_payload_indexes():
+    from datetime import date
+    from vulnrag.models import AffectedProduct, Vulnerability
+    from vulnrag.clients import StubEmbedder
+    client = QdrantClient(":memory:")
+    store = VulnStore(client, "idx_test", 1024)
+    store.ensure_collection()
+    store.ensure_collection()  # idempotent, must not raise
+    emb = StubEmbedder(1024)
+    v = Vulnerability(cve_id="CVE-1", description="x",
+                      affected=[AffectedProduct(product="log4j")],
+                      published=date(2021,1,1), last_modified=date(2021,1,1))
+    store.upsert([v], emb.embed(["x"]))
+    hits = store.search(emb.embed(["x"])[0], product="log4j", top_k=5)
+    assert [h.cve_id for h in hits] == ["CVE-1"]
+
+
+def test_upsert_is_idempotent_by_cve_id():
+    store = _store()
+    emb = StubEmbedder(dim=1024)
+    v = _vuln("CVE-1", "log4j")
+    vec = emb.embed([v.description])
+    store.upsert([v], vec)
+    store.upsert([v], vec)
+    assert store.count() == 1
+
+
+def test_distinct_products():
+    from datetime import date
+    from vulnrag.models import AffectedProduct, Vulnerability
+    from vulnrag.clients import StubEmbedder
+    client = QdrantClient(":memory:")
+    store = VulnStore(client, "dp_test", 1024)
+    store.ensure_collection()
+    emb = StubEmbedder(1024)
+    vulns = [
+        Vulnerability(cve_id="CVE-1", description="a",
+                      affected=[AffectedProduct(product="samtools")],
+                      published=date(2021,1,1), last_modified=date(2021,1,1)),
+        Vulnerability(cve_id="CVE-2", description="b",
+                      affected=[AffectedProduct(product="log4j")],
+                      published=date(2021,1,1), last_modified=date(2021,1,1)),
+    ]
+    store.upsert(vulns, emb.embed(["a","b"]))
+    assert store.distinct_products() == {"samtools", "log4j"}
